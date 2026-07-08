@@ -1,0 +1,247 @@
+---
+name: sonar
+description: Query and update data in the Sonar platform via its GraphQL
+  API. Use whenever the user mentions Sonar, its dashboard, or asks to
+  fetch, list, create, update, or delete projects, prompts, topics,
+  competitors, runs, mentions, citations, project members, or
+  per-prompt/per-competitor stats. Also use for analytics queries
+  (overview, mention trend, citation trend, leaderboard, top cited
+  domains). Requires the SONAR_API_KEY environment variable.
+---
+
+# Sonar GraphQL API
+
+## Endpoint and authentication
+
+- Endpoint defaults to `https://sonar.toptal.com/api/graphql` (production,
+  POST only). Override via `$SONAR_API_URL` for local dev
+  (`http://localhost:3000/api/graphql`).
+- Auth header: `Authorization: Bearer $SONAR_API_KEY`. API keys are
+  prefixed `sonar_`; if you see a different prefix it's not a Sonar key.
+- Always send `User-Agent: sonar-claude-plugin` so the Sonar team
+  can observe plugin-driven traffic.
+- If `$SONAR_API_KEY` is unset or empty, STOP and tell the user to
+  generate a key on their Sonar profile page (Profile → API Keys) and
+  add it to `~/.claude/settings.json` under `env`. Do not attempt
+  unauthenticated calls.
+- Per-key rate limit: 100 requests/minute. Pace yourself when fanning
+  out across many entities; a 429 means back off, do not retry
+  immediately.
+
+## How to execute requests
+
+Use Bash with curl. Always send the query as JSON, always use variables
+for user-provided values — never interpolate them into the query string:
+
+```bash
+curl -s "${SONAR_API_URL:-https://sonar.toptal.com/api/graphql}" \
+  -H "Authorization: Bearer $SONAR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "User-Agent: sonar-claude-plugin" \
+  -d '{"query": "query($n: Int!) { ... }", "variables": {"n": 5}}'
+```
+
+GraphQL returns HTTP 200 even on errors — always inspect the response
+body. There are two error surfaces (see "Result unions" below):
+- **Top-level `errors[]` array** — schema validation, malformed cursors,
+  unexpected server errors. A 401 means the key is invalid or revoked;
+  direct the user to regenerate.
+- **Typed errors as union members** — `NotFoundError`, `ForbiddenError`,
+  `ValidationError`, `ConflictError`. These appear inside the result
+  union for queries and mutations that declare them.
+
+If a call returns `{ "message": "Unexpected error." }` with no further
+detail, that's the masked-error response for a server-side problem
+(missing DB migration, deployment lag, infrastructure issue). Do NOT
+retry — surface the issue to the user and suggest they reach out to
+Sonar support.
+
+## First-use scope introspection
+
+On the first Sonar call in a conversation, fetch the viewer's scope so
+you know what the user's key can do before attempting anything:
+
+```graphql
+{
+  me {
+    user { id name email role }
+    apiKey { id abilities scopeProjects }
+  }
+}
+```
+
+- `apiKey: null` means the request used a session cookie (GraphiQL).
+- `apiKey.abilities`:
+  - `null` — no abilities scope was set when the key was created. The key
+    **inherits the session user's permissions** (an admin still gets
+    `manage`). This is the common default for keys created without
+    toggling abilities.
+  - `[]` (empty list) — the key was **explicitly scoped to zero abilities**
+    and will be denied **every operation**, including reads
+    (`ForbiddenError`).
+  - `["read"]` — read-only key. Reads work; mutations forbidden.
+  - `["manage"]` or `["read", "manage"]` — full access, subject to the user's
+    own rights and `scopeProjects`.
+- `apiKey.scopeProjects` is `[String!]` (project IDs the key is
+  restricted to) or `null` for unscoped. Queries against other projects
+  return `ForbiddenError`.
+
+## Verifying setup
+
+A cheap smoke test confirms key and connectivity:
+
+```graphql
+{ me { user { id name email } } }
+```
+
+Run this first whenever the user says they just set things up. The
+returned email makes the confirmation unambiguous.
+
+## Result unions (typed errors)
+
+Most top-level queries and every mutation are wrapped in a result union.
+Always spread the success case AND the error cases — `__typename`
+discriminates them:
+
+```graphql
+query {
+  project(id: $id) {
+    __typename
+    ... on QueryProjectSuccess { data { id name slug } }
+    ... on NotFoundError { message }
+    ... on ForbiddenError { message }
+  }
+}
+```
+
+The response data lives on the Success member's `data` field; the error
+message on the error member. Validation errors that prevent the
+operation from even parsing (bad cursor, malformed query) still come
+back in the top-level `errors[]` array with
+`extensions.code: BAD_USER_INPUT`.
+
+## Pagination (Relay-style connections)
+
+List fields use cursor connections:
+
+```graphql
+{
+  prompts(projectId: $p, first: 50, after: $cursor) {
+    edges { node { id text } cursor }
+    pageInfo { hasNextPage endCursor }
+    totalCount
+  }
+}
+```
+
+- `first` defaults to 50, capped at 100.
+- `after` is the opaque `endCursor` from the previous page.
+- `totalCount` is the full count and is stable across pages.
+- Some fields (`Run.mentions`, `Run.citations`) use specialized cursors;
+  consult `references/queries.md` for the exact paging shape.
+
+## Mutations: dryRun + intent (REQUIRED)
+
+Mutations only — read operations execute freely. Every mutation accepts
+two extra args alongside its `input` (or alongside its plain ID args
+for `archivePrompt` / `deletePrompt` / `deleteTopic`):
+
+- **`dryRun: Boolean = false`** — validates + computes impact (cascade
+  counts, import plan) without writing. Returns the same Success shape;
+  no audit row is written. Use this to preview before committing.
+- **`intent: String`** (≤ 500 chars) — a SHORT, GENERIC description of
+  WHY the change is happening. Stored in `audit_log.metadata.intent`
+  and reviewable by Sonar admins. Treat it like a commit message:
+  "user asked to delete expired prompts", NOT a verbatim paste of the
+  user's prompt. Never include client names, internal project labels,
+  secrets, or anything the user wouldn't want in a compliance review.
+
+**Workflow for any mutation:**
+
+1. Run with `dryRun: true, intent: "<generic 1-sentence summary>"`.
+   Show the user the cascade or impact counts ("this will delete
+   3 mentions and 2 citations").
+2. Confirm with the user.
+3. Re-run with `dryRun: false` and the same `intent`.
+
+NEVER skip the dryRun preview, even if the user is being explicit —
+confirmation is cheap and the cascade-count visibility is the point.
+
+## Schema and examples
+
+- `references/queries.md` — tested, copy-ready queries and mutations
+  for common tasks. Prefer these over composing from scratch.
+- For exact type, field, or argument names the cookbook doesn't cover,
+  introspect the live schema (next section). Never guess field names.
+
+## Schema discovery (introspection)
+
+The endpoint serves standard GraphQL introspection to authenticated
+callers, so what you see is always the deployed schema — there is no
+bundled SDL copy that could go stale. Use small targeted probes; the
+full `IntrospectionQuery` also works but returns hundreds of KB you
+almost never need.
+
+List every available operation:
+
+```graphql
+{
+  __schema {
+    queryType { fields { name description } }
+    mutationType { fields { name description } }
+  }
+}
+```
+
+Describe one type — works for object types (`fields`), input types
+(`inputFields`), enums (`enumValues`), and result unions
+(`possibleTypes`):
+
+```graphql
+query($type: String!) {
+  __type(name: $type) {
+    kind
+    name
+    description
+    fields {
+      name
+      description
+      args {
+        name
+        defaultValue
+        type { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+      }
+      type { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+    }
+    inputFields {
+      name
+      defaultValue
+      type { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+    }
+    enumValues { name description }
+    possibleTypes { name }
+  }
+}
+```
+
+Use this probe verbatim. The endpoint enforces a query depth limit of 8
+that exempts `__schema`-rooted queries but NOT `__type`-rooted ones —
+the shape above sits exactly at the limit, so do not nest it deeper or
+wrap the `type` selections in a fragment (fragment spreads count as an
+extra level). Three `ofType` levels unwrap every wrapper in this schema
+(e.g. `[ID!]!`).
+
+Typical flow for an unfamiliar operation: list operations → describe
+the result type → follow `possibleTypes` to the Success member →
+describe nested types as needed. Each probe is one cheap request.
+
+## Conduct rules
+
+- If a call returns `ForbiddenError`, the user's key lacks that scope —
+  say so, do not retry. Check `apiKey.scopeProjects` and `abilities`
+  from the first-use introspection to know in advance.
+- If the user asks about data in a project not in `apiKey.scopeProjects`,
+  tell them their key is scoped and they need to either widen the
+  scope or use a different key.
+- Never log or display the value of `$SONAR_API_KEY` to the user
+  ("your key is …"). Keep it implicit.

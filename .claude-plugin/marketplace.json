@@ -1,0 +1,12 @@
+{
+  "name": "sonar",
+  "owner": { "name": "Toptal Sonar Team" },
+  "plugins": [
+    {
+      "name": "sonar",
+      "source": "./sonar",
+      "description": "Query and mutate Sonar data through its GraphQL API. Requires a personal API key from your profile page (Profile → API Keys) in $SONAR_API_KEY.",
+      "category": "productivity"
+    }
+  ]
+}
