@@ -14,11 +14,12 @@ Tested, copy-ready operations against the live Sonar GraphQL API. Every example 
 | Pattern | Where |
 |---|---|
 | First-use scope introspection | `me` query |
+| Session check-in / check-out | `checkInSession` / `checkOutSession` mutations (REQUIRED, enforced) |
 | Result union for queries | `... on Query<Verb>Success { data { … } }` plus error spreads |
 | Result union for mutations | `... on Mutation<Verb>Success { data { … } }` plus error spreads |
 | Cursor pagination | `edges { node cursor }`, `pageInfo { hasNextPage endCursor }`, `totalCount` |
 | Default page size | 50 (max 100); pass `first` to override |
-| Required mutation args | `dryRun: Boolean = false` + `intent: String` |
+| Required mutation args | `dryRun: Boolean = false` + `intent: String` (except `checkInSession` / `checkOutSession`) |
 
 ### Valid `source` values
 
@@ -106,6 +107,103 @@ curl -s "${SONAR_API_URL:-https://sonar.toptal.com/api/graphql}" \
   -H "User-Agent: sonar-claude-plugin" \
   -d '{"query": "{ __schema { queryType { fields { name description } } mutationType { fields { name description } } } }"}'
 ```
+
+---
+
+## Session check-in / check-out (REQUIRED, enforced)
+
+An API-key caller must open a session before any non-exempt call — the
+server returns `SESSION_REQUIRED` (403) otherwise. Only `me`, introspection,
+and `checkInSession` are exempt. Send the returned `id` as the
+`X-Sonar-Session-Id` header on every subsequent request. See `SKILL.md` for
+the full workflow and `intent`/`report` content rules.
+
+### checkInSession — open a session
+
+```graphql
+mutation CheckIn($input: CheckInSessionInput!) {
+  checkInSession(input: $input) { id status intent }
+}
+```
+
+Variables:
+
+```json
+{ "input": { "intent": "user asked to audit prompt coverage for topic X" } }
+```
+
+Sample response:
+
+```json
+{
+  "data": {
+    "checkInSession": {
+      "id": "cmses_abc123",
+      "status": "active",
+      "intent": "user asked to audit prompt coverage for topic X"
+    }
+  }
+}
+```
+
+`checkInSession` / `checkOutSession` do NOT take `dryRun` / `intent` args.
+`intent` (check-in) and `report` (check-out) ARE the payload.
+
+### checkOutSession — close a session with a report
+
+```graphql
+mutation CheckOut($input: CheckOutSessionInput!) {
+  checkOutSession(input: $input) {
+    id
+    status
+    summary {
+      totalActions
+      successCount
+      failureCount
+      byOperation { operation resourceType ok count }
+    }
+  }
+}
+```
+
+Variables:
+
+```json
+{
+  "input": {
+    "sessionId": "cmses_abc123",
+    "report": "Listed prompts for topic X; updated 2 with stale mention rates after confirmation.",
+    "deviations": "none"
+  }
+}
+```
+
+Sample response — `summary` is server-computed from the audit trail of
+writes made during the session, for comparison against your `report`:
+
+```json
+{
+  "data": {
+    "checkOutSession": {
+      "id": "cmses_abc123",
+      "status": "checkedOut",
+      "summary": {
+        "totalActions": 2,
+        "successCount": 2,
+        "failureCount": 0,
+        "byOperation": [
+          { "operation": "updatePrompt", "resourceType": "prompt", "ok": true, "count": 2 }
+        ]
+      }
+    }
+  }
+}
+```
+
+`checkOutSession` returns `NotFoundError` for an unknown or foreign session
+id, and `ConflictError` if the session was already checked out. After
+checkout the session id stops granting access — a new task needs a new
+check-in.
 
 ---
 
@@ -1015,6 +1113,8 @@ Input: `{ id }` — the id of the previously-merged (child) competitor to restor
 ### Top-level `errors[]` array
 
 Only used for schema-validation failures (malformed GraphQL, unknown fields) and truly unexpected server errors. A 401 from the API endpoint means the key is invalid or revoked.
+
+A top-level error with `extensions.code: "SESSION_REQUIRED"` (HTTP 403) means you have not checked in (or your session was already checked out). Call `checkInSession` and retry with the `X-Sonar-Session-Id` header set — this is not a permissions failure.
 
 For known business errors, use the result-union members below.
 

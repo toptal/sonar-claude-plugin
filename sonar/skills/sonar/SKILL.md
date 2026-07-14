@@ -14,7 +14,8 @@ description: Query and update data in the Sonar platform via its GraphQL
 ## Endpoint and authentication
 
 - Endpoint defaults to `https://sonar.toptal.com/api/graphql` (production,
-  POST only). Override via `$SONAR_API_URL` for local dev
+  POST only). Override via `$SONAR_API_URL` for staging
+  (`https://sonar-staging.toptal.net/api/graphql`) or local dev
   (`http://localhost:3000/api/graphql`).
 - Auth header: `Authorization: Bearer $SONAR_API_KEY`. API keys are
   prefixed `sonar_`; if you see a different prefix it's not a Sonar key.
@@ -38,8 +39,13 @@ curl -s "${SONAR_API_URL:-https://sonar.toptal.com/api/graphql}" \
   -H "Authorization: Bearer $SONAR_API_KEY" \
   -H "Content-Type: application/json" \
   -H "User-Agent: sonar-claude-plugin" \
+  -H "X-Sonar-Session-Id: $SONAR_SESSION_ID" \
   -d '{"query": "query($n: Int!) { ... }", "variables": {"n": 5}}'
 ```
+
+The `X-Sonar-Session-Id` header is required on every non-exempt call once
+you have checked in (see "Session check-in / check-out" below). Omit it
+only for the exempt operations (`me`, introspection, `checkInSession`).
 
 GraphQL returns HTTP 200 even on errors — always inspect the response
 body. There are two error surfaces (see "Result unions" below):
@@ -86,9 +92,88 @@ you know what the user's key can do before attempting anything:
   restricted to) or `null` for unscoped. Queries against other projects
   return `ForbiddenError`.
 
+## Session check-in / check-out (REQUIRED, enforced)
+
+This is **structurally enforced**, not etiquette. For an API-key caller,
+the server rejects every request with `SESSION_REQUIRED` (HTTP 403) until
+you have opened a session. The only ungated operations are `me`, schema
+introspection (`__schema` / `__type`), and `checkInSession` itself — so
+you can do first-use scope introspection, then you must check in before
+anything else.
+
+Bracket each distinct task (a coherent goal, however many reads/writes it
+takes) with a check-in / check-out pair:
+
+**1. At the start of the task**, open a session with your intent:
+
+```graphql
+mutation CheckIn($input: CheckInSessionInput!) {
+  checkInSession(input: $input) { id status intent }
+}
+```
+
+```json
+{ "input": { "intent": "user asked to audit prompt coverage for topic X" } }
+```
+
+`intent` follows the same rules as a mutation `intent`: a short, generic
+1–2 sentence description of the task (≤ 2000 chars). Never a verbatim
+paste of the user's message, never client names or secrets.
+
+**2. For the rest of the task**, send the returned `id` as a header on
+**every** request — queries and mutations alike:
+
+```
+X-Sonar-Session-Id: <id from checkInSession>
+```
+
+**3. At the end of the task** (success, partial, or abandoned), check out
+with a report:
+
+```graphql
+mutation CheckOut($input: CheckOutSessionInput!) {
+  checkOutSession(input: $input) {
+    id status
+    summary {
+      totalActions successCount failureCount
+      byOperation { operation resourceType ok count }
+    }
+  }
+}
+```
+
+```json
+{
+  "input": {
+    "sessionId": "<id from checkInSession>",
+    "report": "Listed prompts for topic X; updated 2 with stale mention rates after confirmation.",
+    "deviations": "none"
+  }
+}
+```
+
+- `report`: what you actually did, in the same generic-summary style as
+  `intent`.
+- `deviations`: how the work differed from the stated `intent`. If nothing
+  deviated, send `"none"` explicitly — don't omit the field.
+- `summary` is computed by the server from the audit trail of writes you
+  made during the session. You don't fill it in; it exists so reviewers can
+  compare your report against reality.
+
+**Rules:**
+
+- Check in ONCE per distinct task, right after first-use scope
+  introspection and before your first non-exempt call.
+- After checkout the session id stops working — a new task needs a new
+  check-in.
+- NEVER skip checkout, even if the task failed or you abandoned it midway.
+- `checkInSession` / `checkOutSession` do NOT take `dryRun` / `intent`
+  args like other mutations.
+
 ## Verifying setup
 
-A cheap smoke test confirms key and connectivity:
+A cheap smoke test confirms key and connectivity (`me` is exempt from the
+session gate, so this works before check-in):
 
 ```graphql
 { me { user { id name email } } }
@@ -237,6 +322,11 @@ describe nested types as needed. Each probe is one cheap request.
 
 ## Conduct rules
 
+- If a call returns `SESSION_REQUIRED` (in the top-level `errors[]` array,
+  HTTP 403), you skipped check-in or your session was already checked out.
+  This is NOT a permissions problem — call `checkInSession`, then retry
+  with the `X-Sonar-Session-Id` header set. Don't tell the user their key
+  lacks access.
 - If a call returns `ForbiddenError`, the user's key lacks that scope —
   say so, do not retry. Check `apiKey.scopeProjects` and `abilities`
   from the first-use introspection to know in advance.
