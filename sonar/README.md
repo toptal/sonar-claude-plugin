@@ -52,21 +52,18 @@ Edit `~/.claude/settings.json`:
 Claude will run a smoke-test query and confirm your identity with your
 email address.
 
-## Pointing at staging or local dev
+## Pointing at a local dev server
 
-For internal use against staging or a local dev server, set
-`SONAR_API_URL` alongside the key:
+To run against a local dev server, set `SONAR_API_URL` alongside the key:
 
 ```jsonc
 {
   "env": {
-    "SONAR_API_KEY": "sonar_staging_xxxxxxxx",
-    "SONAR_API_URL": "https://sonar-staging.toptal.net/api/graphql"
+    "SONAR_API_KEY": "sonar_xxxxxxxx",
+    "SONAR_API_URL": "http://localhost:3000/api/graphql"
   }
 }
 ```
-
-For a local Next.js dev server: `http://localhost:3000/api/graphql`.
 
 ## Updates
 

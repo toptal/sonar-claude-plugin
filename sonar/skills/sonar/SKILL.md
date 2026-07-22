@@ -14,8 +14,7 @@ description: Query and update data in the Sonar platform via its GraphQL
 ## Endpoint and authentication
 
 - Endpoint defaults to `https://sonar.toptal.com/api/graphql` (production,
-  POST only). Override via `$SONAR_API_URL` for staging
-  (`https://sonar-staging.toptal.net/api/graphql`) or local dev
+  POST only). Override via `$SONAR_API_URL` for local dev
   (`http://localhost:3000/api/graphql`).
 - Auth header: `Authorization: Bearer $SONAR_API_KEY`. API keys are
   prefixed `sonar_`; if you see a different prefix it's not a Sonar key.
