@@ -13,6 +13,7 @@ Tested, copy-ready operations against the live Sonar GraphQL API. Every example 
 
 | Pattern | Where |
 |---|---|
+| Any aggregate (rates, counts, shares, rankings, trends, distributions) | `Query.analytics` — see [Analytics](#analytics--queryanalytics) |
 | First-use scope introspection | `me` query |
 | Session check-in / check-out | `checkInSession` / `checkOutSession` mutations (REQUIRED, enforced) |
 | Result union for queries | `... on Query<Verb>Success { data { … } }` plus error spreads |
@@ -44,11 +45,9 @@ Reflexively reaching for `(first: N)` on these returns "Unknown argument first" 
 | Bounded (no pagination) | Paginated (connection) |
 |---|---|
 | `Query.projects` | `Query.prompts`, `Query.competitors`, `Query.runs`, `Query.users` |
-| `Project.topics` | `Query.promptStats`, `Query.competitorPromptStats` |
-| `Project.members` | `Project.prompts`, `Project.competitors` |
-| `Prompt.topics` | `Prompt.runs` |
-| `Project.mentionTrend`, `citationTrend`, `leaderboard`, `topCitedDomains`, `mostCitedPages`, `citedPagePrompts` | `Run.mentions`, `Run.citations` |
-| `Prompt.stats`, `Competitor.stats` (1000-row cap — use `Query.promptStats` / `competitorPromptStats` for wide ranges) | |
+| `Project.topics` | `Project.prompts`, `Project.competitors` |
+| `Project.members` | `Prompt.runs`, `Run.mentions`, `Run.citations` |
+| `Prompt.topics` | `Query.analytics` (offset cursor, `first` ≤ 1000, 20000-group cap) |
 
 ---
 
@@ -360,25 +359,6 @@ query PromptRuns($projectId: ID!, $id: ID!, $first: Int, $after: String) {
 }
 ```
 
-### Prompt + per-day stats (capped at 1000 rows — see "1000-row cap" below)
-
-```graphql
-query PromptStats($projectId: ID!, $id: ID!, $range: DateRangeInput!) {
-  prompt(projectId: $projectId, id: $id) {
-    ... on QueryPromptSuccess {
-      data {
-        id
-        stats(dateRange: $range) {
-          date source mentionRate citationRate avgPosition
-        }
-      }
-    }
-  }
-}
-```
-
-For wide ranges (>1000 rows) the field throws `BAD_USER_INPUT`. Use `Query.promptStats` (below) instead.
-
 ---
 
 ## Competitors
@@ -423,34 +403,6 @@ Sample response (3-row page):
   }
 }
 ```
-
-### Competitor + per-day stats (capped at 1000 rows)
-
-```graphql
-query CompetitorStats(
-  $projectId: ID!
-  $first: Int
-  $range: DateRangeInput!
-  $promptId: ID
-) {
-  competitors(projectId: $projectId, first: $first) {
-    ... on QueryCompetitorsSuccess {
-      data {
-        edges {
-          node {
-            id name
-            stats(dateRange: $range, promptId: $promptId) {
-              date promptId source mentionRate citationRate avgPosition
-            }
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-Same 1000-row cap as `Prompt.stats`. For wide ranges use `Query.competitorPromptStats`.
 
 ---
 
@@ -553,260 +505,134 @@ query RunCitations($id: ID!, $first: Int, $after: String) {
 }
 ```
 
-**Known limitation:** `Run.mentions` / `Run.citations` instantiate a fresh DataLoader per Run instance, so listing many runs and asking for mentions in one query fires N service calls (no cross-run batching). Acceptable for one-run-at-a-time navigation; for "list runs × mentions" patterns, paginate runs first then fetch mentions per run separately.
+`Run.mentions` / `Run.citations` batch across sibling runs: listing runs with `citations(first: N)` in one query is a single citation read, as long as every run uses the same `first` / `after`. For counts, shares or distributions over citations use `Query.analytics` instead — pulling raw citations is only for inspecting individual URLs.
 
 ---
 
-## Top-level stat connections (use these for wide date ranges)
+## Analytics — `Query.analytics`
 
-### `promptStats`
+Every aggregated number (overview, trends, leaderboards, domain/page rankings, per-prompt or per-day stats, distributions) comes from **one query**: pick `measures`, optionally `groupBy` dimensions, narrow with `filter`, sort with `orderBy`. It reads pre-aggregated rollups, so a month × every prompt is **one request**, never a fan-out over runs.
+
+**Never reconstruct aggregates by paging `runs` × `Run.citations` / `Run.mentions`.** If a question is "how many / what share / which rank / how does X distribute", it is an `analytics` call. Fall back to runs only when you need the raw answer text or individual citation URLs.
 
 ```graphql
-query PromptStats(
+query Analytics(
   $projectId: ID!
   $range: DateRangeInput!
-  $source: String
-  $promptId: ID
+  $measures: [AnalyticsMeasure!]!
+  $groupBy: [AnalyticsDimension!]
+  $filter: AnalyticsFilter
+  $orderBy: [AnalyticsOrder!]
   $first: Int
   $after: String
 ) {
-  promptStats(
+  analytics(
     projectId: $projectId
     dateRange: $range
-    source: $source
-    promptId: $promptId
+    measures: $measures
+    groupBy: $groupBy
+    filter: $filter
+    orderBy: $orderBy
     first: $first
     after: $after
   ) {
     __typename
-    ... on QueryPromptStatsSuccess {
-      data {
-        edges {
-          node { promptId date source mentionRate citationRate avgPosition }
-          cursor
-        }
-        pageInfo { hasNextPage endCursor }
-        totalCount
-      }
-    }
-  }
-}
-```
-
-Cursor encodes `{ date, promptId }`. Ordered by `date DESC`, `promptId ASC` tiebreak.
-
-### `competitorPromptStats`
-
-```graphql
-query CompetitorPromptStats(
-  $projectId: ID!
-  $range: DateRangeInput!
-  $competitorId: ID
-  $promptId: ID
-  $source: String
-  $first: Int
-  $after: String
-) {
-  competitorPromptStats(
-    projectId: $projectId
-    dateRange: $range
-    competitorId: $competitorId
-    promptId: $promptId
-    source: $source
-    first: $first
-    after: $after
-  ) {
-    ... on QueryCompetitorPromptStatsSuccess {
+    ... on QueryAnalyticsSuccess {
       data {
         edges {
           node {
-            competitorId promptId date source
-            mentionRate citationRate avgPosition
+            date source domain page pageKind isTarget
+            prompt { id text }
+            topic { id name }
+            competitor { id name }
+            answers prompts mentionRate citationRate avgPosition
+            citingAnswers citations citedPrompts citationShare
           }
-          cursor
         }
         pageInfo { hasNextPage endCursor }
         totalCount
       }
     }
+    ... on ValidationError { message }
+    ... on ConflictError { message }
+    ... on NotFoundError { message }
+    ... on ForbiddenError { message }
   }
 }
 ```
 
-Cursor encodes `{ date, promptId, competitorId }`. Ordered by `date DESC`, `promptId ASC`, `competitorId ASC` tiebreak.
+Select only the row fields you need — dimension fields are null unless grouped by, measure fields null unless requested. `prompt`, `topic` and `competitor` are full objects (e.g. `prompt { text topics { name } }`). To compare several projects, alias the field once per project in one request (max 15 aliases).
 
----
+### Vocabulary
 
-## Analytics
+| Dimension (`groupBy`) | Row field | Notes |
+|---|---|---|
+| `DATE` / `WEEK` / `MONTH` | `date` | At most one. WEEK = ISO week labelled by its Monday; MONTH by its 1st. |
+| `SOURCE` | `source` | `chatgpt`, `google_ai_mode`, `gemini` |
+| `PROMPT` | `prompt` | |
+| `TOPIC` | `topic` | Many-to-many: a prompt in 2 topics counts in both rows. |
+| `COMPETITOR` | `competitor` | Switches the rate measures to per-competitor. Not combinable with citation dimensions. |
+| `DOMAIN`, `PAGE`, `PAGE_KIND`, `IS_TARGET` | `domain`, `page`, `pageKind`, `isTarget` | Citation dimensions — citation measures only. `PAGE_KIND` is `HOMEPAGE` (path `/`) vs `OTHER`. Citations whose URL has no parseable domain are counted by no citation measure here (the dashboard shows them as `unknown`), so analytics totals can sit just under it. |
 
-These fields live on `Project` directly (not result-unioned — errors bubble to top-level `errors[]`). All take a required `dateRange: DateRangeInput!` of `YYYY-MM-DD` calendar strings (inclusive).
+| Measure | Meaning |
+|---|---|
+| `ANSWERS` | Answers in the group. **An answer = one prompt × one source × one day.** |
+| `PROMPTS` | Distinct prompts answered. |
+| `MENTION_RATE` / `CITATION_RATE` / `AVG_POSITION` | Target brand's mean rates (0–100) / position — or each competitor's when grouped by `COMPETITOR` (answers without that competitor count as 0). 1 decimal. |
+| `CITING_ANSWERS` | Distinct answers citing ≥1 URL in the group. |
+| `CITATIONS` | Distinct (answer, page) pairs. **Use this for page-level distributions.** |
+| `CITED_PROMPTS` | Distinct prompts with a matching citation. |
+| `CITATION_SHARE` | `CITING_ANSWERS` as % of all answers in the same date/source/prompt/topic group. `null` when the group has no answers to divide by. |
 
-All five — `overview`, `mentionTrend`, `citationTrend`, `leaderboard`, `topCitedDomains` — also accept optional `topicId: ID` and `promptId: ID` filters. Resolve topic IDs from `Project.topics { id name }` first, then pass them through. Passing an unknown topic or prompt id (or one that belongs to a different project) returns a top-level `NOT_FOUND` error — fix the id rather than retrying.
+`filter`: `sources`, `topicIds`, `promptIds`, `includeInactivePrompts` (default false, like the dashboard) apply to everything. `domains`, `domainContains`, `pages`, `pathPrefix`, `pageKind`, `isTarget` narrow **citation measures only** (a share keeps the full answer count as denominator). `domainContains` is case-insensitive; `pathPrefix` and `pages` are not, because paths are case-sensitive. `competitorIds`, `highlightedCompetitors` need `COMPETITOR` in `groupBy`. Resolve topic ids from `Project.topics { id name }` first.
 
-### Project overview
+**Which rows come back is decided by `groupBy`, never by `measures` or the citation filters.** Adding a measure fills one more field on the same rows, and narrowing to one page shrinks the counts on those same rows — so you can diff two responses safely. A citation *dimension* does narrow the rows, to the groups the rollup has a row for. A citation *filter* never does: every group with answers stays a row, reporting `0` rather than disappearing, which is what makes a `DATE` trend a complete time series even under `pathPrefix`. So the "which prompts cite this page" drill-down sorts (`orderBy: [{ measure: CITING_ANSWERS }]`) instead of expecting the filter to shorten the list. Prompt-scope filters (`promptIds`, `topicIds`, `sources`, `includeInactivePrompts`) do narrow the rows — they decide which answers exist at all.
 
-```graphql
-query Overview($id: ID!, $range: DateRangeInput!, $source: String) {
-  project(id: $id) {
-    ... on QueryProjectSuccess {
-      data {
-        overview(dateRange: $range, source: $source) {
-          mentionRate
-          citationRate
-          avgPosition
-          activePromptCount
-        }
-      }
-    }
-  }
-}
+An unsupported combination returns `ValidationError` naming what *is* available — read it and adjust rather than guessing. `ConflictError` means the project's citation rollups are still backfilling; retry in a few minutes.
+
+Results are capped at 20000 groups (`ValidationError` beyond: narrow `dateRange` / `filter` or use a coarser grain like `WEEK`). Pages default to 100 rows, max `first: 1000`. Cursors are bound to the exact arguments — resend the same variables with `after` to continue. They are also bound to the data they were cut from: if a run lands mid-scroll, `after` returns a `ValidationError` telling you to restart from the first page, rather than silently skipping or repeating groups. Prefer a coarser grain or a narrower window over a long page walk.
+
+### Recipes (variables for the query above)
+
+**Homepage vs other pages cited, per day, for a month** — the whole distribution in one call:
+
+```json
+{ "range": { "from": "2026-08-01", "to": "2026-08-31" },
+  "groupBy": ["DATE", "PAGE_KIND"], "measures": ["CITATIONS", "CITING_ANSWERS"] }
 ```
 
-### Mention / citation trends
+**Homepage share per cited domain** (competitor domains only):
 
-```graphql
-query Trends($id: ID!, $range: DateRangeInput!, $source: String) {
-  project(id: $id) {
-    ... on QueryProjectSuccess {
-      data {
-        mentionTrend(dateRange: $range, source: $source) { date value source }
-        citationTrend(dateRange: $range, source: $source) { date value source }
-      }
-    }
-  }
-}
+```json
+{ "groupBy": ["DOMAIN", "PAGE_KIND"], "measures": ["CITATIONS"],
+  "filter": { "isTarget": false }, "orderBy": [{ "measure": "CITATIONS", "direction": "DESC" }] }
 ```
 
-Both trend fields use the same underlying query — the cookbook is built around `getMentionTrend` returning both rates in one call. `value` is a percentage (0–100).
+**Overview** (headline numbers): `{ "measures": ["MENTION_RATE", "CITATION_RATE", "AVG_POSITION", "ANSWERS", "PROMPTS"] }` — no `groupBy` returns one row.
 
-### Leaderboard (target brand excluded)
+**Mention / citation trend:** `{ "groupBy": ["DATE"], "measures": ["MENTION_RATE", "CITATION_RATE"] }` — add `"filter": { "topicIds": ["…"] }` for one topic, `"sources": ["chatgpt"]` for one source.
 
-```graphql
-query Leaderboard($id: ID!, $range: DateRangeInput!, $source: String) {
-  project(id: $id) {
-    ... on QueryProjectSuccess {
-      data {
-        leaderboard(dateRange: $range, source: $source) {
-          competitor { id name domain isHighlighted }
-          mentionRate
-          citationRate
-          avgPosition
-        }
-      }
-    }
-  }
-}
+**Competitor leaderboard** (the dashboard's highlighted set):
+
+```json
+{ "groupBy": ["COMPETITOR"], "measures": ["MENTION_RATE", "CITATION_RATE", "AVG_POSITION"],
+  "filter": { "highlightedCompetitors": true },
+  "orderBy": [{ "measure": "MENTION_RATE", "direction": "DESC" }] }
 ```
 
-`isHighlighted` reflects the persistent flag on the competitor (joined in by the resolver), not a derived metric.
+Competitors with no stats in the window are omitted (their rates are 0).
 
-### Top cited domains
+**Top cited domains:** `{ "groupBy": ["DOMAIN"], "measures": ["CITATION_SHARE", "CITED_PROMPTS"], "orderBy": [{ "measure": "CITATION_SHARE" }], "first": 10 }`
 
-```graphql
-query TopDomains(
-  $id: ID!
-  $range: DateRangeInput!
-  $source: String
-  $limit: Int
-) {
-  project(id: $id) {
-    ... on QueryProjectSuccess {
-      data {
-        topCitedDomains(dateRange: $range, source: $source, limit: $limit) {
-          domain
-          citationCount
-          share
-        }
-      }
-    }
-  }
-}
-```
+**Most cited pages:** `{ "groupBy": ["DOMAIN", "PAGE"], "measures": ["CITED_PROMPTS"], "orderBy": [{ "measure": "CITED_PROMPTS" }], "first": 10 }`
 
-`share` is a percentage (0–100) of (date, prompt, source) tuples whose runs cited that domain.
+**Which prompts cited this page?** `{ "groupBy": ["PROMPT"], "measures": ["CITING_ANSWERS"], "filter": { "domains": ["example.com"], "pages": ["/pricing"] }, "orderBy": [{ "measure": "CITING_ANSWERS" }], "first": 20 }` — every in-scope prompt is a row, so sort and read the top; the rest report `0`.
 
-#### Narrowing to a single topic (and/or prompt)
+**Per-prompt, per-day stats** (the former `promptStats`): `{ "groupBy": ["DATE", "SOURCE", "PROMPT"], "measures": ["MENTION_RATE", "CITATION_RATE", "AVG_POSITION"] }` — page with `first: 1000` / `after`. Large projects over long windows can exceed the 20000-group cap; split `dateRange` (e.g. one week per call).
 
-Same call shape with `topicId` (and optionally `promptId`) added. Resolve the topic id from `Project.topics { id name }` first — the field expects an id, not a name. Example: top cited domains for the "Developers" topic.
+**Per-competitor, per-prompt, per-day stats** (the former `competitorPromptStats`): add `COMPETITOR` to the groupBy above and narrow with `competitorIds`.
 
-```graphql
-query TopDomainsForTopic($id: ID!, $range: DateRangeInput!, $topicId: ID!) {
-  project(id: $id) {
-    ... on QueryProjectSuccess {
-      data {
-        topCitedDomains(dateRange: $range, topicId: $topicId, limit: 10) {
-          domain
-          citationCount
-          share
-        }
-      }
-    }
-  }
-}
-```
-
-The same `topicId` / `promptId` args work on `overview`, `mentionTrend`, `citationTrend`, and `leaderboard`. Use them whenever you have the question "for this topic / this prompt …" instead of paging runs and aggregating client-side.
-
-### Most cited pages
-
-Pages (URL path × domain) ranked by distinct citing prompts. Same call shape as `topCitedDomains` — flat top-N list, no cursor.
-
-```graphql
-query MostCitedPages(
-  $id: ID!
-  $range: DateRangeInput!
-  $source: String
-  $limit: Int
-) {
-  project(id: $id) {
-    ... on QueryProjectSuccess {
-      data {
-        mostCitedPages(dateRange: $range, source: $source, limit: $limit) {
-          id
-          domain
-          page
-          url
-          citedPromptCount
-        }
-      }
-    }
-  }
-}
-```
-
-`id` is `${domain}|${page}` — pages aren't standalone entities, so this composite is the only stable handle. Use it to thread through to the drill-down below.
-
-### Page drill-down — which prompts cited this (domain, page)?
-
-Pass the same `dateRange` / `source` you used in `mostCitedPages` to get the prompts behind a row. Returns full `Prompt` objects, so you can chain `.stats`, `.latestRun`, etc.
-
-```graphql
-query CitedPagePrompts(
-  $id: ID!
-  $domain: String!
-  $page: String!
-  $range: DateRangeInput
-  $source: String
-) {
-  project(id: $id) {
-    ... on QueryProjectSuccess {
-      data {
-        citedPagePrompts(
-          domain: $domain
-          page: $page
-          dateRange: $range
-          source: $source
-        ) {
-          id
-          text
-        }
-      }
-    }
-  }
-}
-```
-
-Typical flow: call `mostCitedPages` first, pick a row, then call `citedPagePrompts` with that row's `domain` + `page` and the **same** `dateRange` / `source` to get a consistent drill-down. Different filters produce different prompts — that's the live behavior, not a bug.
+**Topic comparison by source:** `{ "groupBy": ["TOPIC", "SOURCE"], "measures": ["MENTION_RATE", "CITATION_SHARE"] }`
 
 ---
 
@@ -1124,8 +950,8 @@ For known business errors, use the result-union members below.
 |---|---|
 | `NotFoundError` | Resource doesn't exist or isn't visible to the principal. Existence is collapsed to NotFound across tenant boundaries to prevent enumeration. |
 | `ForbiddenError` | The key's `abilities` lack `manage` for a write op, or `scopeProjects` doesn't include the requested project. |
-| `ValidationError` | Input failed validation (Zod schema, malformed cursor, malformed date, stats-cap exceeded). |
-| `ConflictError` | Uniqueness violation (duplicate name, already-member, already-merged). |
+| `ValidationError` | Input failed validation (Zod schema, malformed cursor, malformed date, unsupported analytics combination, analytics group cap exceeded). |
+| `ConflictError` | Uniqueness violation (duplicate name, already-member, already-merged), or `analytics` over citation rollups that are still backfilling. |
 
 Switch on `__typename` to handle them:
 
@@ -1148,23 +974,6 @@ Switch on `__typename` to handle them:
 ```
 
 Same response if the cursor decodes to a payload with an unparseable date.
-
-### The 1000-row cap on `Prompt.stats` / `Competitor.stats`
-
-These convenience fields are capped at 1000 rows for response-size sanity. Wide date ranges throw `ValidationError` in the top-level `errors[]`:
-
-```json
-{
-  "errors": [
-    {
-      "message": "Prompt.stats result exceeds the 1000-row cap; narrow dateRange or call Query.promptStats with cursor pagination.",
-      "extensions": { "code": "BAD_USER_INPUT" }
-    }
-  ]
-}
-```
-
-When you see this, switch to `Query.promptStats` / `Query.competitorPromptStats` (cursor-paginated, no cap).
 
 ### "Unexpected error" with no further detail
 

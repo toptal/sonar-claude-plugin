@@ -4,9 +4,11 @@ description: Query and update data in the Sonar platform via its GraphQL
   API. Use whenever the user mentions Sonar, its dashboard, or asks to
   fetch, list, create, update, or delete projects, prompts, topics,
   competitors, runs, mentions, citations, project members, or
-  per-prompt/per-competitor stats. Also use for analytics queries
-  (overview, mention trend, citation trend, leaderboard, top cited
-  domains). Requires the SONAR_API_KEY environment variable.
+  per-prompt/per-competitor stats. Also use for any analytics question
+  (mention/citation rates and trends, leaderboards, top cited domains or
+  pages, citation distributions such as homepage vs other pages) — one
+  `analytics` query answers these. Requires the SONAR_API_KEY
+  environment variable.
 ---
 
 # Sonar GraphQL API
@@ -223,6 +225,26 @@ List fields use cursor connections:
 - `totalCount` is the full count and is stable across pages.
 - Some fields (`Run.mentions`, `Run.citations`) use specialized cursors;
   consult `references/queries.md` for the exact paging shape.
+
+## Analytics: one query, never a fan-out
+
+Every aggregate — rates, counts, shares, rankings, trends, distributions,
+per-prompt or per-day stats — comes from `Query.analytics(projectId,
+dateRange, measures, groupBy, filter, orderBy)`. It reads pre-aggregated
+rollups, so "all citations for every prompt for every day of a month,
+split homepage vs other pages" is ONE request
+(`groupBy: [DATE, PAGE_KIND], measures: [CITATIONS]`), not one request per
+prompt-day.
+
+- NEVER page `runs` × `Run.citations` / `Run.mentions` to count, rank or
+  distribute anything, and never sample prompts to work around request
+  volume. Use runs only when the user needs raw answer text or individual
+  citation URLs.
+- A `ValidationError` from `analytics` names the measures/dimensions that
+  are valid for your grouping — fix the request from the message instead of
+  guessing.
+- Vocabulary, filters and copy-ready recipes: `references/queries.md` →
+  "Analytics".
 
 ## Mutations: dryRun + intent (REQUIRED)
 
