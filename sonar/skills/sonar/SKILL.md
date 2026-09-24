@@ -109,7 +109,11 @@ takes) with a check-in / check-out pair:
 
 ```graphql
 mutation CheckIn($input: CheckInSessionInput!) {
-  checkInSession(input: $input) { id status intent }
+  checkInSession(input: $input) {
+    __typename
+    ... on MutationCheckInSessionSuccess { data { id status intent } }
+    ... on ValidationError { message }
+  }
 }
 ```
 
@@ -120,6 +124,8 @@ mutation CheckIn($input: CheckInSessionInput!) {
 `intent` follows the same rules as a mutation `intent`: a short, generic
 1–2 sentence description of the task (≤ 2000 chars). Never a verbatim
 paste of the user's message, never client names or secrets.
+
+The session is at `checkInSession.data.id` (status `ACTIVE`).
 
 **2. For the rest of the task**, send the returned `id` as a header on
 **every** request — queries and mutations alike:
@@ -134,11 +140,19 @@ with a report:
 ```graphql
 mutation CheckOut($input: CheckOutSessionInput!) {
   checkOutSession(input: $input) {
-    id status
-    summary {
-      totalActions successCount failureCount
-      byOperation { operation resourceType ok count }
+    __typename
+    ... on MutationCheckOutSessionSuccess {
+      data {
+        id status
+        summary {
+          totalActions successCount failureCount
+          byOperation { operation resourceType ok count }
+        }
+      }
     }
+    ... on ConflictError { message }
+    ... on NotFoundError { message }
+    ... on ValidationError { message }
   }
 }
 ```
@@ -190,7 +204,7 @@ Always spread the success case AND the error cases — `__typename`
 discriminates them:
 
 ```graphql
-query {
+query Project($id: ID!) {
   project(id: $id) {
     __typename
     ... on QueryProjectSuccess { data { id name slug } }
@@ -211,11 +225,19 @@ back in the top-level `errors[]` array with
 List fields use cursor connections:
 
 ```graphql
-{
-  prompts(projectId: $p, first: 50, after: $cursor) {
-    edges { node { id text } cursor }
-    pageInfo { hasNextPage endCursor }
-    totalCount
+query PromptsPage($projectId: ID!, $after: String) {
+  prompts(projectId: $projectId, first: 50, after: $after) {
+    __typename
+    ... on QueryPromptsSuccess {
+      data {
+        edges { node { id text } cursor }
+        pageInfo { hasNextPage endCursor }
+        totalCount
+      }
+    }
+    ... on NotFoundError { message }
+    ... on ForbiddenError { message }
+    ... on ValidationError { message }
   }
 }
 ```
@@ -240,6 +262,8 @@ prompt-day.
   distribute anything, and never sample prompts to work around request
   volume. Use runs only when the user needs raw answer text or individual
   citation URLs.
+- `dateRange` is inclusive at both ends, in the project's timezone. The
+  latest day can still be filling in — include `ANSWERS` to spot a short day.
 - A `ValidationError` from `analytics` names the measures/dimensions that
   are valid for your grouping — fix the request from the message instead of
   guessing.

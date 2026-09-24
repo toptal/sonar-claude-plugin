@@ -121,7 +121,11 @@ the full workflow and `intent`/`report` content rules.
 
 ```graphql
 mutation CheckIn($input: CheckInSessionInput!) {
-  checkInSession(input: $input) { id status intent }
+  checkInSession(input: $input) {
+    __typename
+    ... on MutationCheckInSessionSuccess { data { id status intent } }
+    ... on ValidationError { message }
+  }
 }
 ```
 
@@ -137,9 +141,12 @@ Sample response:
 {
   "data": {
     "checkInSession": {
-      "id": "cmses_abc123",
-      "status": "active",
-      "intent": "user asked to audit prompt coverage for topic X"
+      "__typename": "MutationCheckInSessionSuccess",
+      "data": {
+        "id": "cmses_abc123",
+        "status": "ACTIVE",
+        "intent": "user asked to audit prompt coverage for topic X"
+      }
     }
   }
 }
@@ -153,14 +160,22 @@ Sample response:
 ```graphql
 mutation CheckOut($input: CheckOutSessionInput!) {
   checkOutSession(input: $input) {
-    id
-    status
-    summary {
-      totalActions
-      successCount
-      failureCount
-      byOperation { operation resourceType ok count }
+    __typename
+    ... on MutationCheckOutSessionSuccess {
+      data {
+        id
+        status
+        summary {
+          totalActions
+          successCount
+          failureCount
+          byOperation { operation resourceType ok count }
+        }
+      }
     }
+    ... on ConflictError { message }
+    ... on NotFoundError { message }
+    ... on ValidationError { message }
   }
 }
 ```
@@ -184,15 +199,18 @@ writes made during the session, for comparison against your `report`:
 {
   "data": {
     "checkOutSession": {
-      "id": "cmses_abc123",
-      "status": "checkedOut",
-      "summary": {
-        "totalActions": 2,
-        "successCount": 2,
-        "failureCount": 0,
-        "byOperation": [
-          { "operation": "updatePrompt", "resourceType": "prompt", "ok": true, "count": 2 }
-        ]
+      "__typename": "MutationCheckOutSessionSuccess",
+      "data": {
+        "id": "cmses_abc123",
+        "status": "CHECKED_OUT",
+        "summary": {
+          "totalActions": 2,
+          "successCount": 2,
+          "failureCount": 0,
+          "byOperation": [
+            { "operation": "updatePrompt", "resourceType": "prompt", "ok": true, "count": 2 }
+          ]
+        }
       }
     }
   }
@@ -590,6 +608,8 @@ Select only the row fields you need — dimension fields are null unless grouped
 
 An unsupported combination returns `ValidationError` naming what *is* available — read it and adjust rather than guessing. `ConflictError` means retry later: the project's citation rollups are still backfilling (minutes), or analytics is momentarily busy or unreachable (seconds).
 
+`dateRange` is calendar dates in the project's timezone, both ends inclusive — `2026-08-01` to `2026-08-31` is all of August — and spans at most 400 days. The latest day can be incomplete while its runs are still landing: request `ANSWERS` alongside and compare it with the days before, rather than reading a drop on that day as a trend.
+
 There is no limit on how many groups a request produces: `totalCount` counts them all, pages default to 100 rows (max `first: 1000`), and a top-N is `orderBy` + the first page. Paging reaches the first 20,000 groups: `hasNextPage` turns `false` there even when `totalCount` is larger, so compare the two to tell a truncated walk from a complete one. Each request has 50 seconds of database time — on the largest projects (thousands of prompts) a 30-day window takes several seconds and a 400-day one can run out, returning a `ValidationError` that asks you to narrow `dateRange` or coarsen the grain. Cursors are bound to the exact arguments — resend the same variables with `after` to continue. They are also bound to the data they were cut from: if a run lands mid-scroll, `after` returns a `ValidationError` telling you to restart from the first page, rather than silently skipping or repeating groups. Prefer a coarser grain or a narrower window over a long page walk.
 
 ### Recipes (variables for the query above)
@@ -956,17 +976,21 @@ For known business errors, use the result-union members below.
 Switch on `__typename` to handle them:
 
 ```graphql
-{
-  ... on QueryProjectSuccess { data { id name } }
-  ... on NotFoundError { message }
-  ... on ForbiddenError { message }
+query Project($id: ID!) {
+  project(id: $id) {
+    __typename
+    ... on QueryProjectSuccess { data { id name } }
+    ... on NotFoundError { message }
+    ... on ForbiddenError { message }
+  }
 }
 ```
 
 ### Bad cursor → `ValidationError` union member
 
 ```graphql
-{ prompts(projectId: $p, first: 5, after: "not-a-valid-cursor") {
+query BadCursor($projectId: ID!) {
+  prompts(projectId: $projectId, first: 5, after: "not-a-valid-cursor") {
     __typename
     ... on ValidationError { message }   # → "Malformed cursor."
   }
