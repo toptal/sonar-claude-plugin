@@ -47,7 +47,7 @@ Reflexively reaching for `(first: N)` on these returns "Unknown argument first" 
 | `Query.projects` | `Query.prompts`, `Query.competitors`, `Query.runs`, `Query.users` |
 | `Project.topics` | `Project.prompts`, `Project.competitors` |
 | `Project.members` | `Prompt.runs`, `Run.mentions`, `Run.citations` |
-| `Prompt.topics` | `Query.analytics` (offset cursor, `first` ≤ 1000, 20000-group cap) |
+| `Prompt.topics` | `Query.analytics` (offset cursor, `first` ≤ 1000, pages reach 20000 groups) |
 
 ---
 
@@ -588,9 +588,9 @@ Select only the row fields you need — dimension fields are null unless grouped
 
 **Which rows come back is decided by `groupBy`, never by `measures` or the citation filters.** Adding a measure fills one more field on the same rows, and narrowing to one page shrinks the counts on those same rows — so you can diff two responses safely. A citation *dimension* does narrow the rows, to the groups the rollup has a row for. A citation *filter* never does: every group with answers stays a row, reporting `0` rather than disappearing, which is what makes a `DATE` trend a complete time series even under `pathPrefix`. So the "which prompts cite this page" drill-down sorts (`orderBy: [{ measure: CITING_ANSWERS }]`) instead of expecting the filter to shorten the list. Prompt-scope filters (`promptIds`, `topicIds`, `sources`, `includeInactivePrompts`) do narrow the rows — they decide which answers exist at all.
 
-An unsupported combination returns `ValidationError` naming what *is* available — read it and adjust rather than guessing. `ConflictError` means the project's citation rollups are still backfilling; retry in a few minutes.
+An unsupported combination returns `ValidationError` naming what *is* available — read it and adjust rather than guessing. `ConflictError` means retry later: the project's citation rollups are still backfilling (minutes), or analytics is momentarily busy or unreachable (seconds).
 
-Results are capped at 20000 groups (`ValidationError` beyond: narrow `dateRange` / `filter` or use a coarser grain like `WEEK`). Pages default to 100 rows, max `first: 1000`. Cursors are bound to the exact arguments — resend the same variables with `after` to continue. They are also bound to the data they were cut from: if a run lands mid-scroll, `after` returns a `ValidationError` telling you to restart from the first page, rather than silently skipping or repeating groups. Prefer a coarser grain or a narrower window over a long page walk.
+There is no limit on how many groups a request produces: `totalCount` counts them all, pages default to 100 rows (max `first: 1000`), and a top-N is `orderBy` + the first page. Paging reaches the first 20,000 groups: `hasNextPage` turns `false` there even when `totalCount` is larger, so compare the two to tell a truncated walk from a complete one. Each request has 50 seconds of database time — on the largest projects (thousands of prompts) a 30-day window takes several seconds and a 400-day one can run out, returning a `ValidationError` that asks you to narrow `dateRange` or coarsen the grain. Cursors are bound to the exact arguments — resend the same variables with `after` to continue. They are also bound to the data they were cut from: if a run lands mid-scroll, `after` returns a `ValidationError` telling you to restart from the first page, rather than silently skipping or repeating groups. Prefer a coarser grain or a narrower window over a long page walk.
 
 ### Recipes (variables for the query above)
 
@@ -628,7 +628,7 @@ Competitors with no stats in the window are omitted (their rates are 0).
 
 **Which prompts cited this page?** `{ "groupBy": ["PROMPT"], "measures": ["CITING_ANSWERS"], "filter": { "domains": ["example.com"], "pages": ["/pricing"] }, "orderBy": [{ "measure": "CITING_ANSWERS" }], "first": 20 }` — every in-scope prompt is a row, so sort and read the top; the rest report `0`.
 
-**Per-prompt, per-day stats** (the former `promptStats`): `{ "groupBy": ["DATE", "SOURCE", "PROMPT"], "measures": ["MENTION_RATE", "CITATION_RATE", "AVG_POSITION"] }` — page with `first: 1000` / `after`. Large projects over long windows can exceed the 20000-group cap; split `dateRange` (e.g. one week per call).
+**Per-prompt, per-day stats** (the former `promptStats`): `{ "groupBy": ["DATE", "SOURCE", "PROMPT"], "measures": ["MENTION_RATE", "CITATION_RATE", "AVG_POSITION"] }` — page with `first: 1000` / `after`. Large projects over long windows produce tens of thousands of groups; prefer a narrower `dateRange` or `WEEK` over a long page walk.
 
 **Per-competitor, per-prompt, per-day stats** (the former `competitorPromptStats`): add `COMPETITOR` to the groupBy above and narrow with `competitorIds`.
 
@@ -950,7 +950,7 @@ For known business errors, use the result-union members below.
 |---|---|
 | `NotFoundError` | Resource doesn't exist or isn't visible to the principal. Existence is collapsed to NotFound across tenant boundaries to prevent enumeration. |
 | `ForbiddenError` | The key's `abilities` lack `manage` for a write op, or `scopeProjects` doesn't include the requested project. |
-| `ValidationError` | Input failed validation (Zod schema, malformed cursor, malformed date, unsupported analytics combination, analytics group cap exceeded). |
+| `ValidationError` | Input failed validation (Zod schema, malformed cursor, malformed date, unsupported analytics combination). |
 | `ConflictError` | Uniqueness violation (duplicate name, already-member, already-merged), or `analytics` over citation rollups that are still backfilling. |
 
 Switch on `__typename` to handle them:
